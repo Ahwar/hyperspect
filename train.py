@@ -418,6 +418,11 @@ def train(hyp, opt, device, tb_writer=None):
                 torch.save(ckpt, last)
                 if best_fitness == fi:
                     torch.save(ckpt, best)
+                if opt.save_each:
+                    # save model at the end of each epoch
+                    epoch_path = wdir / f'epoch_{epoch:03d}.pt'
+                    print("saving epoch", epoch_path)
+                    torch.save(ckpt, epoch_path)
                 if wandb_logger.wandb:
                     if ((epoch + 1) % opt.save_period == 0 and not final_epoch) and opt.save_period != -1:
                         wandb_logger.log_model(
@@ -870,6 +875,11 @@ def train_rgb_ir(hyp, opt, device, tb_writer=None):
                 torch.save(ckpt, last)
                 if best_fitness == fi:
                     torch.save(ckpt, best)
+                if opt.save_each:
+                    # save model at the end of each epoch
+                    epoch_path = wdir / f'epoch_{epoch:03d}.pt'
+                    print("saving epoch", epoch_path)
+                    torch.save(ckpt, epoch_path)
                 if wandb_logger.wandb:
                     if ((epoch + 1) % opt.save_period == 0 and not final_epoch) and opt.save_period != -1:
                         wandb_logger.log_model(
@@ -936,6 +946,7 @@ if __name__ == '__main__':
     parser.add_argument('--rect', action='store_true', help='rectangular training')
     parser.add_argument('--resume', nargs='?', const=True, default=False, help='resume most recent training')
     parser.add_argument('--nosave', action='store_true', help='only save final checkpoint')
+    parser.add_argument('--save-each', action='store_true', help='save checkpoints every epoch')
     parser.add_argument('--notest', action='store_true', help='only test final epoch')
     parser.add_argument('--noautoanchor', action='store_true', help='disable autoanchor check')
     parser.add_argument('--evolve', action='store_true', help='evolve hyperparameters')
