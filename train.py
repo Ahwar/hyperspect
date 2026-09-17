@@ -695,6 +695,21 @@ def train_rgb_ir(hyp, opt, device, tb_writer=None):
                 f'Logging results to {save_dir}\n'
                 f'Starting training for {epochs} epochs...')
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
+        
+        # read file, if contain number of epochs, then break at that point, if contain "stop", then break 
+        if os.path.exists("stopfile.txt"):       
+            with open("stopfile.txt", 'r') as f:
+                lines = f.readlines()
+                for line in lines:
+                    if line.strip() == "stop":
+                        logger.info(f"Stop file contains 'stop', stopping training.")
+                        return results
+                    elif line.strip().isdigit():
+                        stop_epoch = int(line.strip())
+                        if epoch >= stop_epoch:
+                            logger.info(f"Stop file contains epoch {stop_epoch}, stopping training at epoch {epoch}.")
+                            return results
+
         model.train()
 
         # Update image weights (optional)
