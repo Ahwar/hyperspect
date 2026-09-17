@@ -1,4 +1,4 @@
-import os
+import os, argparse
 import random
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -58,11 +58,81 @@ def parse_xml_to_yolo(xml_path, class_to_id):
         yolo_lines.append(f"{cls_id} {x_center:.6f} {y_center:.6f} {box_w:.6f} {box_h:.6f}")
     return yolo_lines
 
+def convert_test_dataset(
+    raw_root="bin/raw",
+    output_root="datasets/hod_converted",
+    cell_size=4
+):
+    raw_root = Path(raw_root)
+    output_root = Path(output_root).resolve()
+
+    test_img_dir = raw_root / "data_test/data_test/VIS"
+    test_xml_dir = raw_root / "data_test/data_test/Annotations/VIS"
+
+    classes_file = raw_root / "class.txt"
+    class_to_id = {}
+    if classes_file.exists():
+        with open(classes_file) as f:
+            classes = [line.strip() for line in f if line.strip()]
+        class_to_id = {cls: i for i, cls in enumerate(classes)}
+
+    test_imgs = sorted(list(test_img_dir.glob("*.png")))
+    if not test_imgs:
+        print(f"No test images found in {test_img_dir}")
+        return
+
+    # Prepare directories
+    streams = ['se_information', 'sa_information']
+    for stream in streams:
+        (output_root / stream / "images" / "test").mkdir(parents=True, exist_ok=True)
+        (output_root / stream / "labels" / "test").mkdir(parents=True, exist_ok=True)
+
+    print(f"Total test samples to convert: {len(test_imgs)}")
+    print("Processing test set...")
+
+    for i, img_path in enumerate(test_imgs, start=1):
+        stem = img_path.stem
+
+        # 1. Check if XML annotation exists for test
+        xml_path = test_xml_dir / f"{stem}.xml" if test_xml_dir.exists() else None
+        label_text = ""
+        if xml_path and xml_path.exists():
+            yolo_lines = parse_xml_to_yolo(xml_path, class_to_id)
+            label_text = "\n".join(yolo_lines)
+
+        # 2. Read raw PNG and extract bands
+        raw_img = np.array(Image.open(img_path))
+        cube = X2Cube(raw_img, cell_size=cell_size)
+
+        # Stream 1 (SE): bands [0, 1, 2]
+        se_rgb = cube_to_pseudo_rgb(cube, bands=[0, 1, 2])
+        # Stream 2 (SA): bands [5, 8, 13]
+        sa_rgb = cube_to_pseudo_rgb(cube, bands=[5, 8, 13])
+
+        # Save SE
+        Image.fromarray(se_rgb).save(output_root / "se_information/images/test" / f"{stem}.png")
+        if label_text:
+            with open(output_root / "se_information/labels/test" / f"{stem}.txt", "w") as f:
+                f.write(label_text)
+
+        # Save SA
+        Image.fromarray(sa_rgb).save(output_root / "sa_information/images/test" / f"{stem}.png")
+        if label_text:
+            with open(output_root / "sa_information/labels/test" / f"{stem}.txt", "w") as f:
+                f.write(label_text)
+
+        if i % 100 == 0 or i == len(test_imgs):
+            print(f"Processed {i}/{len(test_imgs)} test images")
+
+    print(f"Test dataset conversion completed: {len(test_imgs)} samples saved.")
+
+
 def convert_dataset(
     raw_root="bin/raw",
     output_root="datasets/hod_converted",
     val_ratio=0.1,
-    seed=42
+    seed=42,
+    convert_test=True
 ):
     random.seed(seed)
     raw_root = Path(raw_root)
@@ -124,12 +194,17 @@ def convert_dataset(
             with open(output_root / "sa_information/labels" / split / f"{stem}.txt", "w") as f:
                 f.write(label_text)
 
-    # 3. Create dataset YAML file for train.py
+    if convert_test:
+        convert_test_dataset(raw_root=raw_root, output_root=output_root, cell_size=4)
+
+    # 3. Create dataset YAML file for train.py / test.py
     data_yaml = {
         'train_rgb': str(output_root / "se_information/images/train/"),
         'val_rgb': str(output_root / "se_information/images/val/"),
+        'test_rgb': str(output_root / "se_information/images/test/"),
         'train_ir': str(output_root / "sa_information/images/train/"),
         'val_ir': str(output_root / "sa_information/images/val/"),
+        'test_ir': str(output_root / "sa_information/images/test/"),
         'nc': len(classes),
         'names': classes
     }
@@ -142,4 +217,23 @@ def convert_dataset(
     print(f"Done! Dataset YAML saved to {yaml_path}")
 
 if __name__ == '__main__':
-    convert_dataset()
+    parser = argparse.ArgumentParser(description="Convert raw HSI dataset to YOLO two-stream format")
+    parser.add_argument("--raw-root", type=str, default="bin/raw", help="Path to raw data directory")
+    parser.add_argument("--output-root", type=str, default="datasets/hod_converted", help="Output directory")
+    parser.add_argument("--val-ratio", type=float, default=0.1, help="Validation split ratio")
+    parser.add_argument("--mode", type=str, default="all", choices=["all", "train", "test"], help="Conversion mode")
+    args = parser.parse_args()
+
+    if args.mode == "test":
+        """
+        Reads raw test PNG images from bin/raw/data_test/data_test/VIS.
+        Demultiplexes each raw image into a 16-band cube (X2Cube).
+        Generates two-stream pseudo-RGB representations:
+        SE Stream (bands [0, 1, 2]) $\rightarrow$ datasets/hod_converted/se_information/images/test/
+        SA Stream (bands [5, 8, 13]) $\rightarrow$ datasets/hod_converted/sa_information/images/test/
+        Automatically checks for and converts any XML annotations in data_test/data_test/Annotations/VIS if available."""
+        convert_test_dataset(raw_root=args.raw_root, output_root=args.output_root)
+    elif args.mode == "train":
+        convert_dataset(raw_root=args.raw_root, output_root=args.output_root, val_ratio=args.val_ratio, convert_test=False)
+    else:
+        convert_dataset(raw_root=args.raw_root, output_root=args.output_root, val_ratio=args.val_ratio, convert_test=True)
