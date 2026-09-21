@@ -227,7 +227,7 @@ def main():
     logger.info(f"Initializing RF-DETR '{opt.model}' model... (channels: {num_channels})")
     
     model_kwargs = {
-        'pretrain_weights': opt.weights if num_channels == 3 else None, 
+        # 'pretrain_weights': opt.weights if num_channels == 3 else None, 
         'num_classes': num_classes,
         'resolution': opt.img_size,
         'num_channels': num_channels,
@@ -251,12 +251,18 @@ def main():
     # BOTH the main model and the EMA copy are constructed with the right in_channels.
     # Patching forward (lazy expansion) breaks EMA because the EMA model is created
     # before the first forward pass, leaving it with a 3-ch projection.
+    #
+    # We also patch load_pretrain_weights to expand the projection weight in any
+    # pretrained checkpoint (3-ch) to match the model's 6-ch projection before loading.
     if num_channels != 3:
-        logger.info(f"Patching DINOv2 PatchEmbeddings.__init__ for {num_channels} input channels...")
+        logger.info(f"Patching DINOv2 PatchEmbeddings for {num_channels} input channels...")
         import copy as _copy
         from rfdetr.models.backbone.dinov2_with_windowed_attn import Dinov2WithRegistersPatchEmbeddings as _PatchEmbCls
+        from rfdetr.models import weights as _wmod
 
         _target_channels = num_channels
+
+        # 1) Patch __init__ so every new instance (main model + EMA) gets num_channels in_channels
         _orig_patch_init = _PatchEmbCls.__init__
 
         def _multichannel_patch_init(self, config):
@@ -265,6 +271,35 @@ def main():
             _orig_patch_init(self, config_copy)
 
         _PatchEmbCls.__init__ = _multichannel_patch_init
+
+        # 2) Patch load_pretrain_weights to expand 3-ch projection weights in any
+        #    pretrained checkpoint to _target_channels before calling load_state_dict.
+        _orig_lpw = _wmod.load_pretrain_weights
+
+        def _multichannel_lpw(nn_model, model_config):
+            _orig_lsd = torch.nn.Module.load_state_dict
+
+            def _expanded_lsd(self, state_dict, strict=True, **kwargs):
+                expanded = {}
+                for k, v in state_dict.items():
+                    if ('patch_embeddings.projection.weight' in k
+                            and v.ndim == 4
+                            and v.shape[1] < _target_channels):
+                        reps = _target_channels // v.shape[1]
+                        expanded[k] = v.repeat(1, reps, 1, 1) / reps
+                        logger.info(f"  Expanded checkpoint weight {k}: {tuple(v.shape)} -> {tuple(expanded[k].shape)}")
+                    else:
+                        expanded[k] = v
+                return _orig_lsd(self, expanded, strict=strict, **kwargs)
+
+            torch.nn.Module.load_state_dict = _expanded_lsd
+            try:
+                _orig_lpw(nn_model, model_config)
+            finally:
+                torch.nn.Module.load_state_dict = _orig_lsd
+
+        _wmod.load_pretrain_weights = _multichannel_lpw
+
 
     # 5. Add custom callbacks
     # RFDETR maintains a callbacks dictionary matching lightning callback hooks
