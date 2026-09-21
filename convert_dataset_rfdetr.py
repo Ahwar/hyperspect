@@ -144,7 +144,7 @@ def convert_test_dataset(
         print(f"No test images found in {test_img_dir}")
         return
 
-    streams = ['se_information', 'sa_information', 'stack_information']
+    streams = ['se_information', 'sa_information', 'stack_information', 'dual_information']
     for stream in streams:
         (output_root / stream / "test").mkdir(parents=True, exist_ok=True)
 
@@ -168,6 +168,9 @@ def convert_test_dataset(
         sa_rgb = cube_to_pseudo_rgb(cube, bands=[5, 8, 13])
         # Stack: merge SE + SA into a synthetic 3-ch image
         stack_img = merge_to_stack_pseudo(se_rgb, sa_rgb)
+        
+        # Dual: concatenate SE + SA into a 6-ch image
+        dual_tensor = np.concatenate([se_rgb, sa_rgb], axis=-1)
 
         h, w = se_rgb.shape[:2]
 
@@ -175,6 +178,7 @@ def convert_test_dataset(
         Image.fromarray(se_rgb).save(output_root / "se_information/test" / file_name)
         Image.fromarray(sa_rgb).save(output_root / "sa_information/test" / file_name)
         Image.fromarray(stack_img).save(output_root / "stack_information/test" / file_name)
+        np.save(output_root / "dual_information/test" / f"{stem}.npy", dual_tensor)
 
         # Register image info
         coco_data["images"].append({
@@ -235,7 +239,7 @@ def convert_dataset(
         'valid': file_stems[split_idx:]
     }
 
-    streams = ['se_information', 'sa_information', 'stack_information']
+    streams = ['se_information', 'sa_information', 'stack_information', 'dual_information']
     for stream in streams:
         for split in ['train', 'valid']:
             (output_root / stream / split).mkdir(parents=True, exist_ok=True)
@@ -261,6 +265,9 @@ def convert_dataset(
             sa_rgb = cube_to_pseudo_rgb(cube, bands=[5, 8, 13])
             # Stack: merge SE + SA into a synthetic 3-ch image
             stack_img = merge_to_stack_pseudo(se_rgb, sa_rgb)
+            
+            # Dual: concatenate SE + SA into a 6-ch image
+            dual_tensor = np.concatenate([se_rgb, sa_rgb], axis=-1)
 
             h, w = se_rgb.shape[:2]
 
@@ -268,6 +275,7 @@ def convert_dataset(
             Image.fromarray(se_rgb).save(output_root / "se_information" / split / file_name)
             Image.fromarray(sa_rgb).save(output_root / "sa_information" / split / file_name)
             Image.fromarray(stack_img).save(output_root / "stack_information" / split / file_name)
+            np.save(output_root / "dual_information" / split / f"{stem}.npy", dual_tensor)
 
             # 2. Register Image info in COCO
             coco_data["images"].append({
@@ -304,6 +312,9 @@ def convert_dataset(
         'train_stack': str(output_root / "stack_information/train/"),
         'val_stack':   str(output_root / "stack_information/valid/"),
         'test_stack':  str(output_root / "stack_information/test/"),
+        'train_dual':  str(output_root / "dual_information/train/"),
+        'val_dual':    str(output_root / "dual_information/valid/"),
+        'test_dual':   str(output_root / "dual_information/test/"),
         'nc':    len(classes),
         'names': classes
     }

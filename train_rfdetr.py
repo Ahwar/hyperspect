@@ -7,6 +7,7 @@ import logging
 import os
 import yaml
 from pathlib import Path
+import torch
 
 try:
     from lightning.pytorch.callbacks import Callback
@@ -43,6 +44,85 @@ class StopFileCallback(Callback):
                             logger.info(f"Stop file contains epoch {stop_epoch}, stopping training at epoch {trainer.current_epoch}.")
                             trainer.should_stop = True
                             return
+
+
+import numpy as np
+from PIL import Image
+
+class DualStreamWrapper(torch.utils.data.Dataset):
+    def __init__(self, base_dataset):
+        self.base_dataset = base_dataset
+        self.actual_dataset = base_dataset.dataset if isinstance(base_dataset, torch.utils.data.Subset) else base_dataset
+        if not hasattr(self.actual_dataset, 'root'):
+            raise ValueError("Dataset does not have 'root' attribute.")
+        
+        self.se_root = Path(self.actual_dataset.root)
+        self.sa_root = Path(str(self.actual_dataset.root).replace('se_information', 'sa_information').replace('dual_information', 'sa_information'))
+        self.dual_root = Path(str(self.actual_dataset.root).replace('se_information', 'dual_information').replace('sa_information', 'dual_information'))
+
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def _process_pil_pair(self, img_rgb_pil, img_ir_pil, idx):
+        actual_idx = self.base_dataset.indices[idx] if isinstance(self.base_dataset, torch.utils.data.Subset) else idx
+        image_id = self.actual_dataset.ids[actual_idx]
+        annotations = self.actual_dataset._load_target(image_id)
+        
+        import random
+        state = torch.get_rng_state()
+        random_state = random.getstate()
+        np_state = np.random.get_state()
+        
+        target_rgb = {"image_id": image_id, "annotations": annotations}
+        img_rgb, target_out = self.actual_dataset.prepare(img_rgb_pil, target_rgb)
+        if self.actual_dataset._transforms is not None:
+            img_rgb, target_out = self.actual_dataset._transforms(img_rgb, target_out)
+            
+        torch.set_rng_state(state)
+        random.setstate(random_state)
+        np.random.set_state(np_state)
+        
+        target_ir = {"image_id": image_id, "annotations": annotations}
+        img_ir, _ = self.actual_dataset.prepare(img_ir_pil, target_ir)
+        if self.actual_dataset._transforms is not None:
+            img_ir, _ = self.actual_dataset._transforms(img_ir, _)
+            
+        img_dual = torch.cat([img_rgb, img_ir], dim=0)
+        return img_dual, target_out
+
+    def __getitem__(self, idx):
+        import random
+        
+        actual_idx = self.base_dataset.indices[idx] if isinstance(self.base_dataset, torch.utils.data.Subset) else idx
+        image_id = self.actual_dataset.ids[actual_idx]
+        file_name = self.actual_dataset.coco.loadImgs(image_id)[0]["file_name"]
+        stem = Path(file_name).stem
+        
+        npy_path = self.dual_root / f"{stem}.npy"
+        if npy_path.exists():
+            dual_arr = np.load(npy_path)
+            img_rgb_pil = Image.fromarray(dual_arr[:, :, :3])
+            img_ir_pil = Image.fromarray(dual_arr[:, :, 3:])
+            return self._process_pil_pair(img_rgb_pil, img_ir_pil, idx)
+        
+        state = torch.get_rng_state()
+        random_state = random.getstate()
+        np_state = np.random.get_state()
+        
+        orig_root = self.actual_dataset.root
+        self.actual_dataset.root = self.se_root
+        img_rgb, target = self.base_dataset[idx]
+        
+        torch.set_rng_state(state)
+        random.setstate(random_state)
+        np.random.set_state(np_state)
+        
+        self.actual_dataset.root = self.sa_root
+        img_ir, _ = self.base_dataset[idx]
+        self.actual_dataset.root = orig_root
+        
+        img_dual = torch.cat([img_rgb, img_ir], dim=0)
+        return img_dual, target
 
 
 def parse_args():
@@ -100,14 +180,25 @@ def main():
         stream_path = Path(train_stack_raw)
         logger.info("Stack mode: using pre-merged 3-ch pseudo images from stack_information/")
     elif opt.stream_mode == 'dual':
-        # TODO: dual mode requires num_channels=6 + a custom DataModule.
-        # Falling back to RGB for now; set up separately.
-        stream_path = train_rgb_path
+        train_dual_raw = data_dict.get('train_dual', '')
+        if not train_dual_raw:
+            train_dual_raw = data_dict.get('train_rgb', '')
+        stream_path = Path(train_dual_raw)
+        if not stream_path.exists() or any(stream_path.glob("*.npy")):
+            # If stream_path points to dual_information containing .npy files,
+            # build_dataset needs PNG images for initial COCO loading metadata/annotations,
+            # so we fall back stream_path to train_rgb_path (se_information) for dataset building structure.
+            stream_path = train_rgb_path
         num_channels = 6
-        logger.warning(
-            "Dual mode (num_channels=6) selected but a custom 6-ch DataModule is not yet "
-            "implemented. Falling back to RGB directory for now. Set up dual mode separately."
-        )
+        
+        logger.info("Dual mode selected. Wrapping datasets to concatenate RGB and IR on the fly (supporting .npy files).")
+
+        import rfdetr.datasets
+        original_build = rfdetr.datasets.build_dataset
+        def patched_build(*args, **kwargs):
+            dataset = original_build(*args, **kwargs)
+            return DualStreamWrapper(dataset)
+        rfdetr.datasets.build_dataset = patched_build
     else:
         stream_path = train_rgb_path
 
@@ -136,11 +227,11 @@ def main():
     logger.info(f"Initializing RF-DETR '{opt.model}' model... (channels: {num_channels})")
     
     model_kwargs = {
-        'pretrain_weights': opt.weights,
+        'pretrain_weights': opt.weights if num_channels == 3 else None, 
         'num_classes': num_classes,
         'resolution': opt.img_size,
         'num_channels': num_channels,
-        'gradient_checkpointing': opt.gradient_checkpointing,
+        'gradient_checkpointing': opt.gradient_checkpointing
     }
     
     if opt.model == 'small':
@@ -155,6 +246,25 @@ def main():
     else:
         from rfdetr import RFDETR
         model = RFDETR(**model_kwargs)
+
+    # If num_channels != 3, patch Dinov2WithRegistersPatchEmbeddings.__init__ so that
+    # BOTH the main model and the EMA copy are constructed with the right in_channels.
+    # Patching forward (lazy expansion) breaks EMA because the EMA model is created
+    # before the first forward pass, leaving it with a 3-ch projection.
+    if num_channels != 3:
+        logger.info(f"Patching DINOv2 PatchEmbeddings.__init__ for {num_channels} input channels...")
+        import copy as _copy
+        from rfdetr.models.backbone.dinov2_with_windowed_attn import Dinov2WithRegistersPatchEmbeddings as _PatchEmbCls
+
+        _target_channels = num_channels
+        _orig_patch_init = _PatchEmbCls.__init__
+
+        def _multichannel_patch_init(self, config):
+            config_copy = _copy.copy(config)
+            config_copy.num_channels = _target_channels
+            _orig_patch_init(self, config_copy)
+
+        _PatchEmbCls.__init__ = _multichannel_patch_init
 
     # 5. Add custom callbacks
     # RFDETR maintains a callbacks dictionary matching lightning callback hooks
@@ -190,7 +300,7 @@ def main():
             grad_accum_steps=2,
             compute_val_loss=True,
             log_per_class_metrics=True,
-            lr=5e-5,
+            # lr=5e-5,
         )
     except Exception as e:
         logger.error(f"Training failed: {e}")
