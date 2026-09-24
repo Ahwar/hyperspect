@@ -8,6 +8,7 @@ import os
 import yaml
 from pathlib import Path
 import torch
+from rfdetr.datasets.aug_configs import AUG_AGGRESSIVE, AUG_CONSERVATIVE
 
 try:
     from lightning.pytorch.callbacks import Callback
@@ -332,10 +333,18 @@ def main():
             tensorboard=opt.tensorboard,
             class_names=class_names,
             notes=f"Model: {opt.model}, Stream: {opt.stream_mode}",
-            grad_accum_steps=2,
+            grad_accum_steps=6,
             compute_val_loss=True,
-            log_per_class_metrics=True,
-            # lr=5e-5,
+            lr=1e-5,
+            lr_encoder=1.5e-5,
+            aug_config=AUG_AGGRESSIVE,   # start conservative, see below
+            early_stopping=True,
+            early_stopping_patience=20,    # don't stop too early — weak classes converge slower
+            early_stopping_min_delta=0.001,
+            skip_best_epochs=5,
+            use_ema=True,                  # keep default — smoothed weights help generalization
+            log_per_class_metrics=True,    # you need this ON to see your table every epoch
+            best_model_metric="map",
         )
     except Exception as e:
         logger.error(f"Training failed: {e}")
