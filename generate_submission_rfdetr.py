@@ -335,7 +335,7 @@ def apply_multichannel_patch(num_channels: int = 6) -> None:
 
 def load_rfdetr_model(args: argparse.Namespace) -> Any:
     """Initialize and load RF-DETR model directly from checkpoint."""
-    num_channels = 6 if args.stream_mode in ['stack', 'dual'] else 3
+    num_channels = 6 if args.stream_mode == 'dual' else 3
     if num_channels != 3:
         logger.info(f"Applying patch for {num_channels}-channel input (stream_mode={args.stream_mode})...")
         apply_multichannel_patch(num_channels)
