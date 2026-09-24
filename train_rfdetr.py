@@ -99,8 +99,8 @@ class DualStreamWrapper(torch.utils.data.Dataset):
         file_name = self.actual_dataset.coco.loadImgs(image_id)[0]["file_name"]
         stem = Path(file_name).stem
         
-        npy_path = self.dual_root / f"{stem}.npy"
-        if npy_path.exists():
+        npy_path = self._find_npy_path(stem)
+        if npy_path and npy_path.exists():
             dual_arr = np.load(npy_path)
             img_rgb_pil = Image.fromarray(dual_arr[:, :, :3])
             img_ir_pil = Image.fromarray(dual_arr[:, :, 3:])
@@ -109,6 +109,8 @@ class DualStreamWrapper(torch.utils.data.Dataset):
         state = torch.get_rng_state()
         random_state = random.getstate()
         np_state = np.random.get_state()
+        
+        logger.warning(f"Dual npy file not found for stem: {stem}. Falling back to individual SE/SA images.")
         
         orig_root = self.actual_dataset.root
         self.actual_dataset.root = self.se_root
@@ -125,6 +127,112 @@ class DualStreamWrapper(torch.utils.data.Dataset):
         img_dual = torch.cat([img_rgb, img_ir], dim=0)
         return img_dual, target
 
+    def _find_npy_path(self, stem):
+        npy_path = self.dual_root / f"{stem}.npy"
+        if npy_path.exists():
+            return npy_path
+        parent_dir = self.dual_root.parent
+        for split in ['train', 'valid', 'test']:
+            alt_path = parent_dir / split / f"{stem}.npy"
+            if alt_path.exists():
+                return alt_path
+        return None
+
+
+class CubeStreamWrapper(torch.utils.data.Dataset):
+    def __init__(self, base_dataset):
+        self.base_dataset = base_dataset
+        self.actual_dataset = base_dataset.dataset if isinstance(base_dataset, torch.utils.data.Subset) else base_dataset
+        if not hasattr(self.actual_dataset, 'root'):
+            raise ValueError("Dataset does not have 'root' attribute.")
+        
+        self.se_root = Path(self.actual_dataset.root)
+        
+        root_str = str(self.actual_dataset.root)
+        cube_str = root_str.replace('hod_converted_coco/se_information', 'hodcube')
+        cube_str = cube_str.replace('hod_converted_coco/dual_information', 'hodcube')
+        cube_str = cube_str.replace('hod_converted_coco/stack_information', 'hodcube')
+        cube_str = cube_str.replace('hod_converted_coco/sa_information', 'hodcube')
+        self.cube_root = Path(cube_str)
+
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def _find_npy_path(self, stem):
+        npy_path = self.cube_root / f"{stem}.npy"
+        if npy_path.exists():
+            return npy_path
+        parent_dir = self.cube_root.parent
+        for split in ['train', 'valid', 'test']:
+            alt_path = parent_dir / split / f"{stem}.npy"
+            if alt_path.exists():
+                return alt_path
+        return None
+
+    def _process_pil_chunks(self, pil_chunks, idx):
+        actual_idx = self.base_dataset.indices[idx] if isinstance(self.base_dataset, torch.utils.data.Subset) else idx
+        image_id = self.actual_dataset.ids[actual_idx]
+        annotations = self.actual_dataset._load_target(image_id)
+        
+        import random
+        state = torch.get_rng_state()
+        random_state = random.getstate()
+        np_state = np.random.get_state()
+        
+        tensors = []
+        target_out = None
+        for i, pil_chunk in enumerate(pil_chunks):
+            torch.set_rng_state(state)
+            random.setstate(random_state)
+            np.random.set_state(np_state)
+            
+            target = {"image_id": image_id, "annotations": annotations}
+            img, t_out = self.actual_dataset.prepare(pil_chunk, target)
+            if self.actual_dataset._transforms is not None:
+                img, t_out = self.actual_dataset._transforms(img, t_out)
+            
+            if i == 0:
+                target_out = t_out
+            tensors.append(img)
+            
+        return tensors, target_out
+
+    def __getitem__(self, idx):
+        import random
+        
+        actual_idx = self.base_dataset.indices[idx] if isinstance(self.base_dataset, torch.utils.data.Subset) else idx
+        image_id = self.actual_dataset.ids[actual_idx]
+        file_name = self.actual_dataset.coco.loadImgs(image_id)[0]["file_name"]
+        stem = Path(file_name).stem
+        
+        npy_path = self._find_npy_path(stem)
+        if npy_path and npy_path.exists():
+            cube_arr = np.load(npy_path)
+            
+            pil_chunks = []
+            for i in range(5):
+                pil_chunks.append(Image.fromarray(cube_arr[:, :, i*3:(i+1)*3]))
+            
+            last_ch = cube_arr[:, :, 15:16]
+            last_chunk_arr = np.concatenate([last_ch, last_ch, last_ch], axis=2)
+            pil_chunks.append(Image.fromarray(last_chunk_arr))
+            
+            tensors, target_out = self._process_pil_chunks(pil_chunks, idx)
+            
+            final_tensor = torch.cat(tensors[:5] + [tensors[5][0:1, :, :]], dim=0)
+            return final_tensor, target_out
+        
+        logger.warning(f"Cube npy file not found for stem: {stem}. Falling back to 16-channel repeated SE image.")
+        
+        orig_root = self.actual_dataset.root
+        self.actual_dataset.root = self.se_root
+        img_rgb, target = self.base_dataset[idx]
+        self.actual_dataset.root = orig_root
+        
+        reps = (16 + img_rgb.shape[0] - 1) // img_rgb.shape[0]
+        img_cube_fallback = img_rgb.repeat(reps, 1, 1)[:16, :, :]
+        return img_cube_fallback, target
+
 
 def parse_args():
     default_data = './data/hsi/custom_hod_coco.yaml' if os.path.exists('./data/hsi/custom_hod_coco.yaml') else './data/hsi/custom_hod.yaml'
@@ -132,8 +240,8 @@ def parse_args():
     parser.add_argument('--data', type=str, default=default_data, help='data.yaml path')
     parser.add_argument('--weights', type=str, default='rfdtr-small.pth', help='pretrained weights path')
     parser.add_argument('--model', type=str, default='small', choices=['small', 'large', 'xxlarge'], help='model size')
-    parser.add_argument('--stream-mode', type=str, default='rgb', choices=['rgb', 'ir', 'stack', 'dual'], 
-                        help='stream strategy: rgb (default 3ch), ir (3ch), stack (pseudo 3ch), dual (6ch)')
+    parser.add_argument('--stream-mode', type=str, default='rgb', choices=['rgb', 'ir', 'stack', 'dual', 'cube'], 
+                        help='stream strategy: rgb (default 3ch), ir (3ch), stack (pseudo 3ch), dual (6ch), cube (16ch)')
     parser.add_argument('--img-size', type=int, default=576, help='image size (must be divisible by 32)')
     parser.add_argument('--batch-size', type=int, default=2, help='total batch size')
     parser.add_argument('--device', default='0', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
@@ -199,6 +307,23 @@ def main():
         def patched_build(*args, **kwargs):
             dataset = original_build(*args, **kwargs)
             return DualStreamWrapper(dataset)
+        rfdetr.datasets.build_dataset = patched_build
+    elif opt.stream_mode == 'cube':
+        train_cube_raw = data_dict.get('train_cube', '')
+        if not train_cube_raw:
+            train_cube_raw = data_dict.get('train_rgb', '')
+        stream_path = Path(train_cube_raw)
+        if not stream_path.exists() or any(stream_path.glob("*.npy")):
+            stream_path = train_rgb_path
+        num_channels = 16
+        
+        logger.info("Cube mode selected. Wrapping datasets to process 16 channels in chunks.")
+
+        import rfdetr.datasets
+        original_build = rfdetr.datasets.build_dataset
+        def patched_build(*args, **kwargs):
+            dataset = original_build(*args, **kwargs)
+            return CubeStreamWrapper(dataset)
         rfdetr.datasets.build_dataset = patched_build
     else:
         stream_path = train_rgb_path
@@ -286,8 +411,9 @@ def main():
                     if ('patch_embeddings.projection.weight' in k
                             and v.ndim == 4
                             and v.shape[1] < _target_channels):
-                        reps = _target_channels // v.shape[1]
-                        expanded[k] = v.repeat(1, reps, 1, 1) / reps
+                        reps = (_target_channels + v.shape[1] - 1) // v.shape[1]
+                        expanded_weight = v.repeat(1, reps, 1, 1)[:, :_target_channels, :, :]
+                        expanded[k] = expanded_weight / reps
                         logger.info(f"  Expanded checkpoint weight {k}: {tuple(v.shape)} -> {tuple(expanded[k].shape)}")
                     else:
                         expanded[k] = v
@@ -335,13 +461,13 @@ def main():
             notes=f"Model: {opt.model}, Stream: {opt.stream_mode}",
             grad_accum_steps=6,
             compute_val_loss=True,
-            lr=1e-5,
-            lr_encoder=1.5e-5,
-            aug_config=AUG_AGGRESSIVE,   # start conservative, see below
-            early_stopping=True,
-            early_stopping_patience=20,    # don't stop too early — weak classes converge slower
-            early_stopping_min_delta=0.001,
-            skip_best_epochs=5,
+            # lr=1e-5,
+            # lr_encoder=1.5e-5,
+            # aug_config=AUG_AGGRESSIVE,   # start conservative, see below
+            # early_stopping=True,
+            # early_stopping_patience=20,    # don't stop too early — weak classes converge slower
+            # early_stopping_min_delta=0.001,
+            # skip_best_epochs=5,
             use_ema=True,                  # keep default — smoothed weights help generalization
             log_per_class_metrics=True,    # you need this ON to see your table every epoch
             best_model_metric="map",

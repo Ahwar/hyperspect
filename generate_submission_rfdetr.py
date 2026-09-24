@@ -99,6 +99,8 @@ def load_and_preprocess_sample(
 
     elif stream_mode == 'dual':
         # 6-channel composite: [SE (3ch), SA (3ch)]
+        if img_path.suffix.lower() == '.npy':
+            return np.load(img_path)
         if raw_cube is not None:
             se_rgb = cube_to_pseudo_rgb(raw_cube, bands=[0, 1, 2])
             sa_rgb = cube_to_pseudo_rgb(raw_cube, bands=[5, 8, 13])
@@ -247,16 +249,24 @@ def resolve_test_directories(args: argparse.Namespace) -> tuple[Path, Path | Non
     if args.test_dir:
         test_rgb_path = Path(args.test_dir)
         test_ir_path = None
+        test_dual_path = None
     else:
         test_rgb_path = Path(test_rgb) if test_rgb else Path("datasets/hod_converted/se_information/test")
         test_ir_path = Path(test_ir) if test_ir else Path("datasets/hod_converted/sa_information/test")
+        test_dual = data_dict.get("test_dual") or data_dict.get("val_dual") or ""
+        if test_dual:
+            test_dual_path = Path(test_dual)
+        else:
+            test_dual_path = Path(str(test_rgb_path).replace('se_information', 'dual_information').replace('sa_information', 'dual_information'))
 
     # Resolve stream directory path matching train_rfdetr.py logic
     if args.stream_mode == 'rgb':
         stream_path = test_rgb_path
     elif args.stream_mode == 'ir':
         stream_path = test_ir_path if (test_ir_path and test_ir_path.exists()) else test_rgb_path
-    elif args.stream_mode in ['stack', 'dual']:
+    elif args.stream_mode == 'dual':
+        stream_path = test_dual_path if (test_dual_path and test_dual_path.exists()) else test_rgb_path
+    elif args.stream_mode == 'stack':
         stream_path = test_rgb_path
     else:
         stream_path = test_rgb_path
@@ -275,8 +285,61 @@ def resolve_test_directories(args: argparse.Namespace) -> tuple[Path, Path | Non
 
 
 
+def apply_multichannel_patch(num_channels: int = 6) -> None:
+    """Patch DINOv2 PatchEmbeddings and weights loading so 6-channel models can be instantiated and loaded."""
+    if num_channels == 3:
+        return
+    import copy as _copy
+    import torch
+    from rfdetr.models.backbone.dinov2_with_windowed_attn import Dinov2WithRegistersPatchEmbeddings as _PatchEmbCls
+    from rfdetr.models import weights as _wmod
+
+    _target_channels = num_channels
+
+    # Patch __init__ so every new instance gets num_channels in_channels
+    _orig_patch_init = _PatchEmbCls.__init__
+
+    def _multichannel_patch_init(self, config):
+        config_copy = _copy.copy(config)
+        config_copy.num_channels = _target_channels
+        _orig_patch_init(self, config_copy)
+
+    _PatchEmbCls.__init__ = _multichannel_patch_init
+
+    # Patch load_pretrain_weights to handle channel expansion if loading a 3-ch checkpoint into 6-ch model
+    _orig_lpw = _wmod.load_pretrain_weights
+
+    def _multichannel_lpw(nn_model, model_config, trust=True):
+        _orig_lsd = torch.nn.Module.load_state_dict
+
+        def _expanded_lsd(self, state_dict, strict=True, **kwargs):
+            expanded = {}
+            for k, v in state_dict.items():
+                if ('patch_embeddings.projection.weight' in k
+                        and v.ndim == 4
+                        and v.shape[1] < _target_channels):
+                    reps = _target_channels // v.shape[1]
+                    expanded[k] = v.repeat(1, reps, 1, 1) / reps
+                else:
+                    expanded[k] = v
+            return _orig_lsd(self, expanded, strict=strict, **kwargs)
+
+        torch.nn.Module.load_state_dict = _expanded_lsd
+        try:
+            return _orig_lpw(nn_model, model_config, trust=trust)
+        finally:
+            torch.nn.Module.load_state_dict = _orig_lsd
+
+    _wmod.load_pretrain_weights = _multichannel_lpw
+
+
 def load_rfdetr_model(args: argparse.Namespace) -> Any:
     """Initialize and load RF-DETR model directly from checkpoint."""
+    num_channels = 6 if args.stream_mode in ['stack', 'dual'] else 3
+    if num_channels != 3:
+        logger.info(f"Applying patch for {num_channels}-channel input (stream_mode={args.stream_mode})...")
+        apply_multichannel_patch(num_channels)
+
     checkpoint_path = Path(args.checkpoint)
     from rfdetr import RFDETR
     logger.info("Loading RF-DETR model from checkpoint: %s...", checkpoint_path)
@@ -298,7 +361,7 @@ def generate_submission(args: argparse.Namespace) -> None:
 
     # Gather test images sorted numerically or alphabetically
     img_files = sorted(
-        [p for p in primary_test_path.iterdir() if p.suffix.lower() in (".jpg", ".jpeg", ".png")],
+        [p for p in primary_test_path.iterdir() if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".npy")],
         key=lambda p: int(p.stem) if p.stem.isdigit() else p.name,
     )
 
