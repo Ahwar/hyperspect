@@ -240,8 +240,8 @@ def parse_args():
     parser.add_argument('--data', type=str, default=default_data, help='data.yaml path')
     parser.add_argument('--weights', type=str, default='rfdtr-small.pth', help='pretrained weights path')
     parser.add_argument('--model', type=str, default='small', choices=['small', 'large', 'xxlarge'], help='model size')
-    parser.add_argument('--stream-mode', type=str, default='rgb', choices=['rgb', 'ir', 'stack', 'dual', 'cube'], 
-                        help='stream strategy: rgb (default 3ch), ir (3ch), stack (pseudo 3ch), dual (6ch), cube (16ch)')
+    parser.add_argument('--stream-mode', type=str, default='rgb', choices=['rgb', 'ir', 'stack', 'dual', 'cube', 'cube-adapter'], 
+                        help='stream strategy: rgb (default 3ch), ir (3ch), stack (pseudo 3ch), dual (6ch), cube (16ch expand), cube-adapter (16ch adapter)')
     parser.add_argument('--img-size', type=int, default=576, help='image size (must be divisible by 32)')
     parser.add_argument('--batch-size', type=int, default=2, help='total batch size')
     parser.add_argument('--device', default='0', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
@@ -273,6 +273,7 @@ def main():
     train_ir_path = Path(data_dict.get('train_ir', ''))
     
     num_channels = 3
+    multichannel_strategy = 'expand'  # default: surgically modify patch embedding in_channels
     if opt.stream_mode == 'rgb':
         stream_path = train_rgb_path
     elif opt.stream_mode == 'ir':
@@ -325,6 +326,25 @@ def main():
             dataset = original_build(*args, **kwargs)
             return CubeStreamWrapper(dataset)
         rfdetr.datasets.build_dataset = patched_build
+    elif opt.stream_mode == 'cube-adapter':
+        train_cube_raw = data_dict.get('train_cube', '')
+        if not train_cube_raw:
+            train_cube_raw = data_dict.get('train_rgb', '')
+        stream_path = Path(train_cube_raw)
+        if not stream_path.exists() or any(stream_path.glob("*.npy")):
+            stream_path = train_rgb_path
+        num_channels = 16
+        multichannel_strategy = 'adapter'  # 1×1 conv adapter before frozen 3-ch patch embedding
+        
+        logger.info("Cube-adapter mode selected. Using 1×1 conv adapter before DINOv2 patch embedding.")
+
+        # pyrefly: ignore [missing-import]
+        import rfdetr.datasets
+        original_build = rfdetr.datasets.build_dataset
+        def patched_build(*args, **kwargs):
+            dataset = original_build(*args, **kwargs)
+            return CubeStreamWrapper(dataset)
+        rfdetr.datasets.build_dataset = patched_build
     else:
         stream_path = train_rgb_path
 
@@ -352,11 +372,19 @@ def main():
     # 4. Initialize Model
     logger.info(f"Initializing RF-DETR '{opt.model}' model... (channels: {num_channels})")
     
+    # Build model_kwargs depending on multichannel strategy.
+    # 'expand' strategy: pass actual num_channels to the model, surgically modify patch embedding.
+    # 'adapter' strategy: pass num_channels=3 (pretrained), add 1×1 adapter before patch embedding.
+    if multichannel_strategy == 'adapter':
+        model_num_channels = 3  # keep DINOv2 patch embedding at pretrained 3-ch
+    else:
+        model_num_channels = num_channels
+
     model_kwargs = {
         # 'pretrain_weights': opt.weights if num_channels == 3 else None, 
         'num_classes': num_classes,
         'resolution': opt.img_size,
-        'num_channels': num_channels,
+        'num_channels': model_num_channels,
         'gradient_checkpointing': opt.gradient_checkpointing
     }
     
@@ -373,15 +401,12 @@ def main():
         from rfdetr import RFDETR
         model = RFDETR(**model_kwargs)
 
-    # If num_channels != 3, patch Dinov2WithRegistersPatchEmbeddings.__init__ so that
-    # BOTH the main model and the EMA copy are constructed with the right in_channels.
-    # Patching forward (lazy expansion) breaks EMA because the EMA model is created
-    # before the first forward pass, leaving it with a 3-ch projection.
-    #
-    # We also patch load_pretrain_weights to expand the projection weight in any
-    # pretrained checkpoint (3-ch) to match the model's 6-ch projection before loading.
-    if num_channels != 3:
-        logger.info(f"Patching DINOv2 PatchEmbeddings for {num_channels} input channels...")
+    # ---------- Multi-channel strategy: EXPAND (existing) ----------
+    # Surgically modify DINOv2 patch embedding in_channels from 3 → num_channels.
+    # Patches __init__ so BOTH the main model and the EMA copy get num_channels,
+    # and patches load_pretrain_weights to tile/average the 3-ch pretrained kernel.
+    if num_channels != 3 and multichannel_strategy == 'expand':
+        logger.info(f"[expand] Patching DINOv2 PatchEmbeddings for {num_channels} input channels...")
         import copy as _copy
         from rfdetr.models.backbone.dinov2_with_windowed_attn import Dinov2WithRegistersPatchEmbeddings as _PatchEmbCls
         from rfdetr.models import weights as _wmod
@@ -427,6 +452,81 @@ def main():
 
         _wmod.load_pretrain_weights = _multichannel_lpw
 
+    # ---------- Multi-channel strategy: ADAPTER (new) ----------
+    # Adds a learnable 1×1 Conv2d(num_channels, 3) adapter as a submodule of
+    # PatchEmbeddings. The pretrained 3-ch patch embedding is fully untouched;
+    # only the lightweight adapter trains from scratch.
+    # Because the adapter is a proper nn.Module child of PatchEmbeddings, it
+    # automatically participates in EMA, checkpointing, and optimizer param groups.
+    elif num_channels != 3 and multichannel_strategy == 'adapter':
+        logger.info(f"[adapter] Injecting 1×1 channel adapter ({num_channels}→3) into DINOv2 PatchEmbeddings...")
+        from rfdetr.models.backbone.dinov2_with_windowed_attn import Dinov2WithRegistersPatchEmbeddings as _PatchEmbCls
+        from rfdetr.models import weights as _wmod
+
+        _adapter_in = num_channels   # e.g. 16
+        _adapter_out = 3             # pretrained DINOv2 expects 3
+
+        # 1) Patch __init__: after normal 3-ch construction, attach a 1×1 adapter conv.
+        _orig_patch_init = _PatchEmbCls.__init__
+
+        def _adapter_patch_init(self, config):
+            _orig_patch_init(self, config)  # builds normal 3-ch projection
+            # Add adapter as a registered submodule (in the nn.Module tree)
+            self.channel_adapter = torch.nn.Conv2d(
+                _adapter_in, _adapter_out, kernel_size=1, bias=False
+            )
+            # Initialize: uniform averaging so initial output ≈ mean of channel groups,
+            # giving a reasonable starting point instead of random noise.
+            torch.nn.init.constant_(self.channel_adapter.weight, 1.0 / _adapter_in)
+            # Override num_channels so the forward channel-count check passes
+            self.num_channels = _adapter_in
+
+        _PatchEmbCls.__init__ = _adapter_patch_init
+
+        # 2) Patch forward: apply adapter before the pretrained patch projection.
+        _orig_patch_forward = _PatchEmbCls.forward
+
+        def _adapter_patch_forward(self, pixel_values):
+            # Reduce N-ch input to 3-ch using the learnable adapter
+            pixel_values = self.channel_adapter(pixel_values)
+            # Now call the original forward with 3-ch data.
+            # Temporarily set num_channels=3 so the original check passes.
+            saved_nc = self.num_channels
+            self.num_channels = 3
+            try:
+                return _orig_patch_forward(self, pixel_values)
+            finally:
+                self.num_channels = saved_nc
+
+        _PatchEmbCls.forward = _adapter_patch_forward
+
+        # 3) Patch load_pretrain_weights: allow missing channel_adapter keys
+        #    (the pretrained checkpoint won't have them — they start from init).
+        _orig_lpw = _wmod.load_pretrain_weights
+
+        def _adapter_lpw(nn_model, model_config):
+            _orig_lsd = torch.nn.Module.load_state_dict
+
+            def _lenient_lsd(self, state_dict, strict=True, **kwargs):
+                # Separate adapter keys (missing in pretrained ckpt) from the rest
+                model_keys = set(self.state_dict().keys())
+                adapter_keys = {k for k in model_keys if 'channel_adapter' in k}
+                ckpt_keys = set(state_dict.keys())
+                missing_adapter = adapter_keys - ckpt_keys
+                if missing_adapter:
+                    logger.info(f"  Adapter keys not in checkpoint (will keep init): {sorted(missing_adapter)}")
+                    # Load non-strictly so missing adapter keys don't error
+                    return _orig_lsd(self, state_dict, strict=False, **kwargs)
+                return _orig_lsd(self, state_dict, strict=strict, **kwargs)
+
+            torch.nn.Module.load_state_dict = _lenient_lsd
+            try:
+                _orig_lpw(nn_model, model_config)
+            finally:
+                torch.nn.Module.load_state_dict = _orig_lsd
+
+        _wmod.load_pretrain_weights = _adapter_lpw
+
 
     # 5. Add custom callbacks
     # RFDETR maintains a callbacks dictionary matching lightning callback hooks
@@ -459,7 +559,7 @@ def main():
             tensorboard=opt.tensorboard,
             class_names=class_names,
             notes=f"Model: {opt.model}, Stream: {opt.stream_mode}",
-            grad_accum_steps=6,
+            grad_accum_steps=8,
             compute_val_loss=True,
             # lr=1e-5,
             # lr_encoder=1.5e-5,
